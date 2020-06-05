@@ -2,6 +2,7 @@
 #include <fstream>
 #include <sstream>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <cstring>
 #include <string>
@@ -17,6 +18,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <shared_mutex>
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -138,6 +140,10 @@ struct Str {
     const int n = (int)prefix.length();
     if (len() < n) return false;
     return strncmp(s.c_str() + (len() - n), prefix.c_str(), n) == 0;
+  }
+
+  std::string sub(int begin, int end) {
+    return s.substr(begin, end - begin);
   }
 
   static bool isBlank(char c) {
@@ -366,16 +372,16 @@ int mkdirp(const std::string& path) {
 
 }  // namespace filesys
 
-const string& projectDir() {
-  static string path_ = filesys::getCurrPath();
+const string& srcRootPath() {
+  static const string path_ = filesys::getCurrPath();
   return path_;
 }
 
 const string& cppflag() {
   static string flag_ = []() {
-    OSS(ss) << "g++ -std=c++11 -pthread -fpic -fPIC -O2 "
+    OSS(ss) << "g++ -std=c++17 -pthread -fpic -fPIC -O2 "
             << "-g -Werror -Wall -Wno-unused-variable -g -I"
-            << projectDir();
+            << srcRootPath();
     return ss.str();
   }();
   return flag_;
@@ -395,6 +401,75 @@ int strToBuildType(const std::string& s) {
   };
   auto iter = map_.find(s);
   return iter == map_.end() ? 0 : iter->second;
+}
+
+unordered_map<string, uint64_t> g_headers_mod_ts;
+std::shared_mutex g_headers_mod_ts_mtx;
+
+bool needUpdateWhenHeaderMod(const std::string& cc,
+                             uint64_t obj_mod_ts) {
+  ifstream fin(cc);
+  if (!fin.good()) {
+    fail("read src fail: " + cc);
+  }
+  int i, j;
+  bool in_comment = false;
+  for (Str line; getline(fin, line.s); ) {
+    if (line.empty()) {
+      continue;
+    }
+    if (in_comment) {
+      if (line.endsWith("*/")) in_comment = false;
+      continue;
+    }
+    if (line.s[0] == '/') {
+      switch (line.s[1]) {
+      case '/':
+        break;
+      case '*':
+        in_comment = true;
+        break;
+      default:
+        return true;
+      }
+      continue;
+    }
+    if (!line.startsWith("#include")) {
+      return false;
+    }
+
+    // header file abs_path
+    string abs_path;
+    i = line.find('"', 8);
+    if (i > 0) {
+      j = line.find('"', ++i);
+      if (j < 0) return true;
+      abs_path = filesys::getDirPath(cc) + "/" + line.sub(i, j);
+    } else {
+      i = line.find('<', 8);
+      if (i < 0) return true;
+      j = line.find('>', ++i);
+      if (j < 0) return true;
+      abs_path = srcRootPath() + "/" + line.sub(i, j);
+    }
+
+    {
+      std::shared_lock rlk(g_headers_mod_ts_mtx);
+      auto iter = g_headers_mod_ts.find(abs_path);
+      if (iter != g_headers_mod_ts.end()) {
+        if (iter->second > obj_mod_ts) return true;
+        continue;
+      }
+    }
+    auto mod_ts = filesys::lastModTimeSec(abs_path);
+    {
+      std::unique_lock wlk(g_headers_mod_ts_mtx);
+      g_headers_mod_ts.emplace(abs_path, mod_ts);
+    }
+    if (mod_ts > obj_mod_ts) return true;
+  }
+  fin.close();
+  return false;
 }
 
 std::atomic<bool> g_has_build_fail(false);
@@ -466,7 +541,10 @@ public:
       uint64_t obj_mod_ts = filesys::lastModTimeSec(obj_dir + obj_name);
       if (obj_mod_ts > 0) {
         uint64_t cc_mod_ts = filesys::lastModTimeSec(cc);
-        if (cc_mod_ts < obj_mod_ts) continue;
+        if (cc_mod_ts < obj_mod_ts &&
+            !needUpdateWhenHeaderMod(cc, obj_mod_ts)) {
+          continue;
+        }
       }
       cmd.clear();
       cmd << cmd_prefix << obj_name << " " << cc;
@@ -618,6 +696,9 @@ void initTargetMgr(TargetMgr& mgr) {
   }
 }
 
+/**
+ * project_name: name of dir of yml file
+ */
 void parseBuildYml(std::string yml_path, TargetMgr& targetMgr) {
   yml_path = filesys::toAbsPath(yml_path);
   loginfo << "to parse: " << yml_path << logendl;
@@ -703,7 +784,7 @@ void parseBuildYml(std::string yml_path, TargetMgr& targetMgr) {
           curr->src.emplace_back(src_s.s);
         } else {
           auto dir_path = filesys::getDirPath(src_s.s);
-          filesys::FileInfo fi(projectDir() + "/" + dir_path);
+          filesys::FileInfo fi(srcRootPath() + "/" + dir_path);
           if (!fi.is_dir) {
             ymlFail("dir not exist: " + fi.path, yml_path, line_no);
           }
