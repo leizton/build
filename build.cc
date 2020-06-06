@@ -15,8 +15,10 @@ const std::string gk_targetdir_obj = "target/.objs/";
 const std::string gk_targetdir_src = "target/.src/";
 const std::string gk_targetdir_meta = "target/.meta/";
 
-unordered_map<string, uint64_t> g_headers_mod_ts;
-std::shared_mutex g_headers_mod_ts_mtx;
+std::string g_project_name;
+
+unordered_map<string, uint64_t> g_srcfile_mod_ts;
+std::shared_mutex g_srcfile_mod_ts_mtx;
 
 std::atomic<bool> g_has_build_fail(false);
 conc::CountDownLatch g_leaf_target_left;
@@ -52,70 +54,94 @@ int strToBuildType(const std::string& s) {
   return iter == map_.end() ? 0 : iter->second;
 }
 
-bool needUpdateWhenHeaderMod(const std::string& cc,
-                             uint64_t obj_mod_ts) {
-  ifstream fin(cc);
+/**
+ * two kinds of header file
+ *   1. #include "$relative_path"
+ *      real path of $relative_path: getDirPath(src) + $relative_path
+ *   2. #include "$abs_path"
+ *      $abs_path: $project_name/...
+ *      real path of $abs_path: current project root path + $abs_path
+ *      $abs_path must start with current project name
+ */
+unordered_set<string> extractHeaders(const std::string& src) {
+  unordered_set<string> ret;
+  ifstream fin(src);
   if (!fin.good()) {
-    fail("read src fail: " + cc);
+    fail("open file fail: " + src);
   }
-  int i, j;
+
+  int i, j, lineno=0;
   bool in_comment = false;
+  #define PARSE_FAIL \
+    fail("extract header fail in " + src + ", " + to_string(lineno));
   for (Str line; getline(fin, line.s); ) {
-    if (line.empty()) {
-      continue;
-    }
+    lineno++;
+    if (line.empty()) continue;
     if (in_comment) {
-      if (line.endsWith("*/")) in_comment = false;
+      in_comment = !line.endsWith("*/");
       continue;
     }
-    if (line.s[0] == '/') {
-      switch (line.s[1]) {
-      case '/':
-        break;
-      case '*':
-        in_comment = true;
-        break;
-      default:
-        return true;
+    if (line[0] == '/') {
+      switch (line[1]) {
+      case '/': break;
+      case '*': in_comment = true; break;
+      default: PARSE_FAIL;
       }
       continue;
     }
     if (!line.startsWith("#include")) {
-      return false;
+      return ret;
     }
 
-    // header file abs_path
-    string abs_path;
+    // header file real abs path
+    string real_abs_path;
     i = line.find('"', 8);
     if (i > 0) {
       j = line.find('"', ++i);
-      if (j < 0) return true;
-      abs_path = filesys::getDirPath(cc) + "/" + line.sub(i, j);
+      if (j < 0) PARSE_FAIL;
+      real_abs_path = filesys::getDirPath(src) + "/" + line.substr(i, j);
     } else {
       i = line.find('<', 8);
-      if (i < 0) return true;
-      j = line.find('>', ++i);
-      if (j < 0) return true;
-      abs_path = srcRootPath() + "/" + line.sub(i, j);
+      if (i < 0) PARSE_FAIL;
+      if (!line.startsWith(g_project_name, ++i)) continue;
+      j = line.find('>', i + (int)g_project_name.length());
+      if (j < 0) PARSE_FAIL;
+      real_abs_path = srcRootPath() + "/" + line.substr(i, j);
     }
-
-    {
-      std::shared_lock rlk(g_headers_mod_ts_mtx);
-      auto iter = g_headers_mod_ts.find(abs_path);
-      if (iter != g_headers_mod_ts.end()) {
-        if (iter->second > obj_mod_ts) return true;
-        continue;
-      }
-    }
-    auto mod_ts = filesys::lastModTimeSec(abs_path);
-    {
-      std::unique_lock wlk(g_headers_mod_ts_mtx);
-      g_headers_mod_ts.emplace(abs_path, mod_ts);
-    }
-    if (mod_ts > obj_mod_ts) return true;
+    ret.emplace(real_abs_path);
   }
   fin.close();
-  return false;
+  return ret;
+}
+
+inline uint64_t lastModTime(const std::string& src) {
+  auto mod_ts = filesys::lastModTimeSec(src);
+  if (mod_ts == 0) {
+    fail("get last modTime fail: " + src);
+  }
+  return mod_ts;
+}
+
+/**
+ * ignore circle include
+ */
+uint64_t maxModTime(const std::string& src) {
+  {
+    std::shared_lock rlk(g_srcfile_mod_ts_mtx);
+    auto iter = g_srcfile_mod_ts.find(src);
+    if (iter != g_srcfile_mod_ts.end()) {
+      return iter->second;
+    }
+  }
+  auto max_ts = lastModTime(src);
+  for (auto& e : extractHeaders(src)) {
+    max_ts = std::max(max_ts, maxModTime(e));
+  }
+  {
+    std::unique_lock wlk(g_srcfile_mod_ts_mtx);
+    g_srcfile_mod_ts.emplace(src, max_ts);
+  }
+  return max_ts;
 }
 
 struct TargetItem;
@@ -185,9 +211,8 @@ public:
       obj_names_.push_back(obj_name);
       uint64_t obj_mod_ts = filesys::lastModTimeSec(obj_dir + obj_name);
       if (obj_mod_ts > 0) {
-        uint64_t cc_mod_ts = filesys::lastModTimeSec(cc);
-        if (cc_mod_ts < obj_mod_ts &&
-            !needUpdateWhenHeaderMod(cc, obj_mod_ts)) {
+        uint64_t cc_mod_ts = maxModTime(cc);
+        if (cc_mod_ts < obj_mod_ts) {
           continue;
         }
       }
@@ -503,14 +528,12 @@ void compileObjects(vector<string>& cmds, int task_num) {
     i = (i+1) % task_num;
   }
 
-  vector<conc::Thread> threads;
+  conc::ThreadGroup thread_group("compileObjs");
   for (auto& part : cmd_parts) {
     if (part.empty()) continue;
-    threads.emplace_back("", std::bind(doCompileObjects, part));
+    thread_group.addTask(std::bind(doCompileObjects, part));
   }
-  for (auto& th : threads) {
-    th.run();
-  }
+  thread_group.wait();
   loginfo << "compile " << g_compile_objects_n.load()
           << " objects done" << logendl;
 }
@@ -534,6 +557,38 @@ void computeTargetDepLevel(TargetMgr& mgr) {
   }
 }
 
+void getObjectCompileCmds(TargetMgr& targetMgr, int task_num,
+                          vector<string>& ret)
+{
+  vector<vector<TargetItem*>> target_parts;
+  target_parts.resize(task_num);
+  int i = 0;
+  for (auto& e : targetMgr.targets) {
+    target_parts[i].push_back(e.second.get());
+    i = (i+1) % task_num;
+  }
+
+  vector<vector<string>> ret_parts;
+  ret_parts.resize(task_num);
+  conc::ThreadGroup thread_group("getObjCompileCmd");
+  for (size_t i = 0; i < target_parts.size(); i++) {
+    if (target_parts[i].empty()) continue;
+    auto task = [&target_parts, &ret_parts, i] {
+      for (auto target : target_parts[i]) {
+        target->getObjectCompileCmd(ret_parts[i]);
+      }
+    };
+    thread_group.addTask(task);
+  }
+  thread_group.wait();
+
+  for (auto& ret_part : ret_parts) {
+    for (auto& cmd : ret_part) {
+      ret.emplace_back(cmd);
+    }
+  }
+}
+
 void build(TargetMgr& targetMgr) {
   filesys::mkdirp(gk_targetdir_bin);
   filesys::mkdirp(gk_targetdir_lib);
@@ -541,11 +596,10 @@ void build(TargetMgr& targetMgr) {
   filesys::mkdirp(gk_targetdir_src);
   filesys::mkdirp(gk_targetdir_meta);
 
-  vector<string> obj_compiles;
-  for (auto& e : targetMgr.targets) {
-    e.second->getObjectCompileCmd(obj_compiles);
-  }
-  compileObjects(obj_compiles, 10);
+  const int task_num = 8;
+  vector<string> obj_compile_cmds;
+  getObjectCompileCmds(targetMgr, task_num, obj_compile_cmds);
+  compileObjects(obj_compile_cmds, task_num);
   if (g_has_build_fail) return;
 
   for (auto& e : targetMgr.targets) {
@@ -579,5 +633,6 @@ void build(TargetMgr& targetMgr) {
 int main() {
   TargetMgr rootTargets;
   parseBuildYml("build.yml", rootTargets);
+  g_project_name = rootTargets.project_name;
   build(rootTargets);
 }

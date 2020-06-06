@@ -20,14 +20,15 @@ inline uint64_t now() {
 #define loginfo std::cout << "\033[37m[I" << now()-g_start_ts << "] "
 #define logwarn std::cout << "\033[33m[W" << now()-g_start_ts << "] "
 #define logerr  std::cout << "\033[31m[E" << now()-g_start_ts << "] "
-#define logendl "\033[0m" << std::endl;
+#define logendl RESET << std::endl;
 
 static uint64_t g_start_ts = now();
 
 #define OSS(ss) std::ostringstream ss; ss
 
 void fail(const std::string& msg) {
-  logerr << msg << RESET << logendl;
+  OSS(ss) << RED << msg << "\n" << RESET;
+  std::cout << ss.str() << std::endl;
   exit(1);
 }
 
@@ -104,6 +105,10 @@ struct Str {
     if (s.length() < prefix.length()) return false;
     return strncmp(s.c_str(), prefix.c_str(), prefix.length()) == 0;
   }
+  bool startsWith(const std::string& prefix, int offset) {
+    if (s.length() + offset < prefix.length()) return false;
+    return strncmp(s.c_str() + offset, prefix.c_str(), prefix.length()) == 0;
+  }
 
   bool endsWith(const std::string& prefix) {
     const int n = (int)prefix.length();
@@ -111,7 +116,7 @@ struct Str {
     return strncmp(s.c_str() + (len() - n), prefix.c_str(), n) == 0;
   }
 
-  std::string sub(int begin, int end) {
+  std::string substr(int begin, int end) {
     return s.substr(begin, end - begin);
   }
 

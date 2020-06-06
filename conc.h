@@ -4,40 +4,6 @@
 
 namespace conc {
 
-typedef std::function<void()> Task;
-
-class Thread {
-public:
-  Thread(const std::string& _name, const Task& task)
-    : name(_name), task_(task), th_(nullptr) {}
-
-  ~Thread() { join(); }
-
-  void run() {
-    th_.reset(new std::thread(task_));
-  }
-
-  void join() {
-    if (th_ && th_->joinable()) {
-      th_->join();
-      th_.reset();
-    }
-  }
-
-public:
-  const uint64_t id = id_gen_++;
-  const std::string name;
-
-private:
-  static std::atomic<uint64_t> id_gen_;
-  Task task_;
-  std::shared_ptr<std::thread> th_;
-};
-
-std::atomic<uint64_t> Thread::id_gen_(0);
-
-typedef std::shared_ptr<Thread> ThreadPtr;
-
 class CountDownLatch {
 public:
   CountDownLatch() : num_(0) {}
@@ -60,6 +26,65 @@ private:
   int32_t num_;
   std::mutex mtx_;
   std::condition_variable cond_;
+};
+
+typedef std::function<void()> Task;
+
+class Thread {
+public:
+  Thread(const Task& task)
+    : name("_"), task_(task), th_(nullptr) {}
+
+  Thread(const std::string& _name, const Task& task)
+    : name(_name), task_(task), th_(nullptr) {}
+
+  ~Thread() { join(); }
+
+  void run() {
+    th_.reset(new std::thread(task_));
+  }
+
+  void join() {
+    if (th_ && th_->joinable()) {
+      th_->join();
+      th_.reset();
+    }
+  }
+
+public:
+  const std::string name;
+
+private:
+  Task task_;
+  std::shared_ptr<std::thread> th_;
+};
+
+typedef std::shared_ptr<Thread> ThreadPtr;
+
+class ThreadGroup {
+public:
+  ThreadGroup(const std::string _name)
+    : name(_name) {}
+
+  void addTask(const Task& task) {
+    auto th = std::make_shared<Thread>(
+      name + "-" + std::to_string(next_thread_id_++), task);
+    threads_.push_back(th);
+    th->run();
+  }
+
+  void wait() {
+    for (auto& th : threads_) {
+      th->join();
+    }
+  }
+
+public:
+  const std::string name;
+
+private:
+  int next_thread_id_ = 0;
+  std::vector<ThreadPtr> threads_;
 };
 
 }  // namespace conc
