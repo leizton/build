@@ -1,30 +1,7 @@
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <chrono>
-#include <limits>
-#include <memory>
-#include <cstring>
-#include <string>
-#include <algorithm>
-#include <functional>
-#include <vector>
-#include <set>
-#include <unordered_set>
-#include <map>
-#include <unordered_map>
-#include <queue>
-#include <atomic>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <shared_mutex>
-
-#include <stdlib.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+#include "base.h"
+#include "utils.h"
+#include "conc.h"
+#include "filesys.h"
 
 using namespace std;
 
@@ -32,345 +9,17 @@ const char* version() {
   return VERSION;
 }
 
-#define RESET       "\033[0m"
-#define BLACK       "\033[30m"         // Black
-#define RED         "\033[31m"         // Red
-#define GREEN       "\033[32m"         // Green
-#define YELLOW      "\033[33m"         // Yellow
-#define BLUE        "\033[34m"         // Blue
-#define MAGENTA     "\033[35m"         // Magenta
-#define CYAN        "\033[36m"         // Cyan
-#define WHITE       "\033[37m"         // White
+const std::string gk_targetdir_bin = "target/bin/";
+const std::string gk_targetdir_lib = "target/lib/";
+const std::string gk_targetdir_obj = "target/.objs/";
+const std::string gk_targetdir_src = "target/.src/";
+const std::string gk_targetdir_meta = "target/.meta/";
 
-#define loginfo std::cout << "\033[37m[I" << now()-g_start_ts << "] "
-#define logwarn std::cout << "\033[33m[W" << now()-g_start_ts << "] "
-#define logerr  std::cout << "\033[31m[E" << now()-g_start_ts << "] "
-#define logendl "\033[0m" << std::endl;
+unordered_map<string, uint64_t> g_headers_mod_ts;
+std::shared_mutex g_headers_mod_ts_mtx;
 
-inline uint64_t now() {
-  using namespace std::chrono;
-  return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-}
-
-static uint64_t g_start_ts = now();
-
-#define OSS(ss) std::ostringstream ss; ss
-
-void fail(const string& msg) {
-  logerr << msg << RESET << logendl;
-  exit(1);
-}
-
-void ymlFail(const string& msg, const std::string& yml_path, int line_no) {
-  ostringstream ss;
-  ss << "[" << yml_path << ":" << line_no << " parse fail] " << msg;
-  fail(ss.str());
-}
-
-#define print(expr) loginfo << std::boolalpha << (expr) << logendl;
-
-struct CStr {
-  const char* s;
-  const int n;
-  CStr() : s(""), n(0) {}
-  CStr(const char* s_) : s(s_), n(::strlen(s_)) {}
-  CStr(const std::string& s_) : s(s_.c_str()), n(s_.length()) {}
-};
-
-struct Str {
-  std::string s;
-
-  Str() {}
-  Str(const std::string& str) : s(str) {}
-  Str(std::string&& str) : s(str) {}
-
-  int len() { return (int)s.length(); }
-  bool empty() { return s.empty(); }
-
-  char operator[](int i) const { return s[i]; }
-  char& operator[](int i) { return s[i]; }
-
-  int find(char c, int p = 0) {
-    size_t i = s.find(c, p);
-    return i == std::string::npos ? -1 : int(i);
-  }
-  int find(const std::string& str, int p = 0) {
-    size_t i = s.find(str, p);
-    return i == std::string::npos ? -1 : int(i);
-  }
-  int rfind(char c, int p = -1) {
-    if (p < 0) p = len();
-    size_t i = s.rfind(c, p);
-    return i == std::string::npos ? -1 : i;
-  }
-  int rfind(const std::string& str, int p = -1) {
-    if (p < 0) p = len();
-    size_t i = s.rfind(str, p);
-    return i == std::string::npos ? -1 : i;
-  }
-
-  void trimLeft() {
-    int i = 0;
-    for (; isBlank(s[i]); i++);
-    if (i > 0) {
-      s = s.substr(i);
-    }
-  }
-
-  void trimRight() {
-    int i = len() - 1;
-    for (; i >= 0 && isBlank(s[i]); i--);
-    if (++i < len()) {
-      s = s.substr(0, i);
-    }
-  }
-
-  void trim() {
-    if (empty()) return;
-    trimLeft();
-    trimRight();
-  }
-
-  bool startsWith(const std::string& prefix) {
-    if (s.length() < prefix.length()) return false;
-    return strncmp(s.c_str(), prefix.c_str(), prefix.length()) == 0;
-  }
-
-  bool endsWith(const std::string& prefix) {
-    const int n = (int)prefix.length();
-    if (len() < n) return false;
-    return strncmp(s.c_str() + (len() - n), prefix.c_str(), n) == 0;
-  }
-
-  std::string sub(int begin, int end) {
-    return s.substr(begin, end - begin);
-  }
-
-  static bool isBlank(char c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-  }
-};
-
-namespace conc {
-
-typedef std::function<void()> Task;
-
-class Thread {
-public:
-  Thread(const std::string& _name, const Task& task)
-    : name(_name), task_(task), th_(nullptr) {}
-
-  ~Thread() { join(); }
-
-  void run() {
-    th_.reset(new std::thread(task_));
-  }
-
-  void join() {
-    if (th_ && th_->joinable()) {
-      th_->join();
-      th_.reset();
-    }
-  }
-
-public:
-  const uint64_t id = id_gen_++;
-  const std::string name;
-
-private:
-  static std::atomic<uint64_t> id_gen_;
-  Task task_;
-  std::shared_ptr<std::thread> th_;
-};
-
-std::atomic<uint64_t> Thread::id_gen_(0);
-
-typedef std::shared_ptr<Thread> ThreadPtr;
-
-class CountDownLatch {
-public:
-  CountDownLatch() : num_(0) {}
-  CountDownLatch(int32_t n) : num_(n) {}
-
-  void wait() {
-    std::unique_lock<std::mutex> lk(mtx_);
-    cond_.wait(lk, [this] { return this->num_ <= 0; });
-  }
-
-  void countDown(int32_t n) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    num_ -= n;
-    if (num_ <= 0) {
-      cond_.notify_all();
-    }
-  }
-
-private:
-  int32_t num_;
-  std::mutex mtx_;
-  std::condition_variable cond_;
-};
-
-}  // namespace conc
-
-namespace filesys {
-
-struct FileInfo {
-  const std::string path;
-  const bool is_exist = false;
-  const bool is_file = false;
-  const bool is_dir = false;
-  const int size = 0;
-  const uint64_t last_mod_sec = 0;
-
-  explicit FileInfo(const std::string& path_) : path(path_) {
-    init();
-  }
-
-  void traverseSubFiles(std::function<void(const std::string&)> udf) {
-    if (!is_dir) return;
-    DIR* dir = ::opendir(path.c_str());
-    if (!dir) return;
-
-    struct dirent* e = nullptr;
-    while ((e = ::readdir(dir)) != nullptr) {
-      udf(e->d_name);
-    }
-    ::closedir(dir);
-  }
-
-private:
-  void init() {
-    struct stat st;
-    if (::stat(path.c_str(), &st)) {
-      return;
-    }
-    const_cast<bool&>(is_exist) = true;
-    const_cast<bool&>(is_file) = S_ISREG(st.st_mode);
-    const_cast<bool&>(is_dir) = S_ISDIR(st.st_mode);
-    const_cast<int&>(size) = st.st_size;
-    const_cast<uint64_t&>(last_mod_sec) = st.st_mtime;
-  }
-};
-
-const std::string& getCurrPath() {
-  static char buf[8192];
-  static std::string path = []() -> const char* {
-    if (getcwd(buf, 8192-1) == buf) return buf;
-    return "";
-  }();
-  return path;
-}
-
-std::string getDirPath(const std::string& path, int upper = 1) {
-  size_t idx = path.length();
-  for (; upper > 0; upper--) {
-    idx = path.rfind('/', idx);
-    if (idx == std::string::npos) return "/";
-    if (idx == 0) return "/";
-    idx--;
-  }
-  return path.substr(0, idx+1);
-}
-
-std::string toAbsPath(const std::string& path) {
-  if (path.empty()) return getCurrPath();
-  if (path[0] == '/') return path;
-
-  int upper = 0, idx = 0;
-  int len = path.length();
-  int len1 = len - 1;
-  while (idx < len) {
-    if (path[idx] == '/') {
-      idx++;
-      continue;
-    }
-    if (path[idx] != '.') {
-      break;
-    }
-    if (idx == len1) {
-      idx++;
-      break;
-    }
-
-    if (path[idx+1] == '.') {
-      upper++;
-      idx += 2;
-      while (idx < len && path[idx] == '.') idx++;
-    }
-    else if (path[idx+1] == '/') {
-      idx += 2;
-    }
-    else {
-      break;
-    }
-  }
-
-  if (upper == 0) {
-    if (idx >= len) return getCurrPath();
-    return getCurrPath() + "/" + path;
-  }
-
-  std::string prefix = getDirPath(getCurrPath(), upper);
-  if (idx >= len) return prefix;
-  return prefix + "/" + path.substr(idx);
-}
-
-std::string getFileName(const std::string& path) {
-  auto idx = path.rfind('/');
-  if (idx == path.length()-1) {
-    if (idx == 0) return "";
-    if (--idx == 0) return "";
-    idx = path.rfind('/', idx);
-  }
-  return (idx == std::string::npos) ? "" : path.substr(idx+1);
-}
-
-bool isExist(const std::string& path) {
-  return access(path.c_str(), F_OK) == 0;
-}
-
-bool isReadable(const std::string& path) {
-  return access(path.c_str(), F_OK | R_OK) == 0;
-}
-
-/**
- * @return
- *   0  fail
- */
-uint64_t lastModTimeSec(const std::string& path) {
-  struct stat st;
-  if (::stat(path.c_str(), &st)) {
-    return 0;
-  }
-  return st.st_mtime;
-}
-
-/**
- * @param
- *   _p  create intermediate directories as required
- * @return
- *    0  succ;
- *    1  already exist;
- *   -1  fail;
- */
-int mkdir(const std::string& path, bool _p = false) {
-  int ret = ::mkdir(path.c_str(), S_IRWXU|S_IRWXG);
-  if (ret == 0) return 0;
-  if (access(path.c_str(), F_OK|X_OK) == 0) return 0;
-  if (!_p) return -1;
-
-  auto p1 = getDirPath(path);
-  if (p1.empty() || isExist(p1)) return ret;
-  if ((ret = mkdir(p1, true)) != 0) return ret;
-  return ::mkdir(path.c_str(), S_IRWXU|S_IRWXG);
-}
-
-int mkdirp(const std::string& path) {
-  return mkdir(path, true);
-}
-
-}  // namespace filesys
+std::atomic<bool> g_has_build_fail(false);
+conc::CountDownLatch g_leaf_target_left;
 
 const string& srcRootPath() {
   static const string path_ = filesys::getCurrPath();
@@ -402,9 +51,6 @@ int strToBuildType(const std::string& s) {
   auto iter = map_.find(s);
   return iter == map_.end() ? 0 : iter->second;
 }
-
-unordered_map<string, uint64_t> g_headers_mod_ts;
-std::shared_mutex g_headers_mod_ts_mtx;
 
 bool needUpdateWhenHeaderMod(const std::string& cc,
                              uint64_t obj_mod_ts) {
@@ -472,11 +118,10 @@ bool needUpdateWhenHeaderMod(const std::string& cc,
   return false;
 }
 
-std::atomic<bool> g_has_build_fail(false);
-conc::CountDownLatch g_leaf_target_left;
-
 struct TargetItem;
 typedef shared_ptr<TargetItem> TargetItemPtr;
+struct TargetMgr;
+typedef shared_ptr<TargetMgr> TargetMgrPtr;
 
 struct TargetItem {
 public:
@@ -499,7 +144,7 @@ private:
 public:
   TargetItem(int id_, const string& name_)
     : id(id_), name(name_),
-      obj_dir("target/objects/" + name + "/"),
+      obj_dir(gk_targetdir_obj + name + "/"),
       prevn_(0), th_(nullptr)
   {}
 
@@ -507,13 +152,13 @@ public:
     string& target_path_ref = const_cast<string&>(target_path);
     switch (build_type) {
     case BuildType::STATIC :
-      target_path_ref = "target/lib/lib" + name + ".a";
+      target_path_ref = gk_targetdir_lib + "lib" + name + ".a";
       break;
     case BuildType::SHARE :
-      target_path_ref = "target/lib/lib" + name + ".so";
+      target_path_ref = gk_targetdir_lib + "lib" + name + ".so";
       break;
     case BuildType::BINARY :
-      target_path_ref = "target/bin/" + name;
+      target_path_ref = gk_targetdir_bin + name;
       break;
     default:
       fail("init target fail: " + name);
@@ -563,7 +208,7 @@ public:
       objs = ss.str();
     }
 
-    string lib_path_param = " -L./target/lib ";
+    string lib_path_param = " -L./" + gk_targetdir_lib + " ";
     string link_base_libs = " -lpthread ";
     string lib_dep;
     if (build_type != BuildType::STATIC) {
@@ -890,9 +535,11 @@ void computeTargetDepLevel(TargetMgr& mgr) {
 }
 
 void build(TargetMgr& targetMgr) {
-  filesys::mkdirp("target/objects");
-  filesys::mkdirp("target/lib");
-  filesys::mkdirp("target/bin");
+  filesys::mkdirp(gk_targetdir_bin);
+  filesys::mkdirp(gk_targetdir_lib);
+  filesys::mkdirp(gk_targetdir_obj);
+  filesys::mkdirp(gk_targetdir_src);
+  filesys::mkdirp(gk_targetdir_meta);
 
   vector<string> obj_compiles;
   for (auto& e : targetMgr.targets) {

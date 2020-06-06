@@ -1,0 +1,29 @@
+#pragma once
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <chrono>
+#include <limits>
+#include <memory>
+#include <cstring>
+#include <string>
+#include <algorithm>
+#include <functional>
+#include <vector>
+#include <set>
+#include <unordered_set>
+#include <map>
+#include <unordered_map>
+#include <queue>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <shared_mutex>
+
+#include <stdlib.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <sys/stat.h>
