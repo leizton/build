@@ -16,6 +16,7 @@ const std::string gk_targetdir_src = "target/.src/";
 const std::string gk_targetdir_meta = "target/.meta/";
 
 std::string g_project_name;
+volatile bool g_debug = false;
 
 unordered_map<string, uint64_t> g_srcfile_mod_ts;
 std::shared_mutex g_srcfile_mod_ts_mtx;
@@ -57,23 +58,22 @@ int strToBuildType(const std::string& s) {
 /**
  * two kinds of header file
  *   1. #include "$relative_path"
- *      real path of $relative_path: getDirPath(src) + $relative_path
+ *      real_path == getDirPath(src) + $relative_path
+ *                OR current_project_root_path + $relative_path
  *   2. #include "$abs_path"
- *      $abs_path: $project_name/...
- *      real path of $abs_path: current project root path + $abs_path
- *      $abs_path must start with current project name
+ *      real_path == current_project_root_path + $relative_path
  */
 unordered_set<string> extractHeaders(const std::string& src) {
+  #define PARSE_FAIL \
+    fail("extract header fail in " + src + ", " + to_string(lineno));
   unordered_set<string> ret;
   ifstream fin(src);
   if (!fin.good()) {
-    fail("open file fail: " + src);
+    return ret;
   }
 
   int i, j, lineno=0;
   bool in_comment = false;
-  #define PARSE_FAIL \
-    fail("extract header fail in " + src + ", " + to_string(lineno));
   for (Str line; getline(fin, line.s); ) {
     lineno++;
     if (line.empty()) continue;
@@ -94,32 +94,23 @@ unordered_set<string> extractHeaders(const std::string& src) {
     }
 
     // header file real abs path
-    string real_abs_path;
     i = line.find('"', 8);
     if (i > 0) {
       j = line.find('"', ++i);
       if (j < 0) PARSE_FAIL;
-      real_abs_path = filesys::getDirPath(src) + "/" + line.substr(i, j);
+      ret.emplace(filesys::getDirPath(src) + "/" + line.substr(i, j));
+      ret.emplace(srcRootPath() + "/" + line.substr(i, j));
     } else {
       i = line.find('<', 8);
       if (i < 0) PARSE_FAIL;
-      if (!line.startsWith(g_project_name, ++i)) continue;
-      j = line.find('>', i + (int)g_project_name.length());
+      j = line.find('>', ++i);
       if (j < 0) PARSE_FAIL;
-      real_abs_path = srcRootPath() + "/" + line.substr(i, j);
+      ret.emplace(srcRootPath() + "/" + line.substr(i, j));
     }
-    ret.emplace(real_abs_path);
   }
   fin.close();
   return ret;
-}
-
-inline uint64_t lastModTime(const std::string& src) {
-  auto mod_ts = filesys::lastModTimeSec(src);
-  if (mod_ts == 0) {
-    fail("get last modTime fail: " + src);
-  }
-  return mod_ts;
+  #undef PARSE_FAIL
 }
 
 /**
@@ -133,7 +124,7 @@ uint64_t maxModTime(const std::string& src) {
       return iter->second;
     }
   }
-  auto max_ts = lastModTime(src);
+  auto max_ts = filesys::lastModTimeSec(src);
   for (auto& e : extractHeaders(src)) {
     max_ts = std::max(max_ts, maxModTime(e));
   }
@@ -216,7 +207,7 @@ public:
           continue;
         }
       }
-      cmd.clear();
+      cmd.str("");
       cmd << cmd_prefix << obj_name << " " << cc;
       obj_compiles.emplace_back(cmd.str());
     }
@@ -291,10 +282,26 @@ public:
     }
 
     if (::system(cmd.str().c_str())) {
+      {
+        OSS(ss) << RED << "[exec fail: " << cmd.str() << "]" << RESET << "\n";
+        cout << ss.str();
+      }
+      {
+        OSS(ss) << RED << "[build target fail: " << name << "]" << RESET << "\n";
+        cout << ss.str();
+      }
       g_has_build_fail = true;
       return false;
     } else {
+      if (g_debug) {
+        OSS(ss) << YELLOW << "[exec ok: " << cmd.str() << "]" << RESET << "\n";
+        cout << ss.str();
+      }
       return true;
+    }
+    {
+      OSS(ss) << BLUE << "[build target ok: " << name << "]" << RESET << "\n";
+      cout << ss.str();
     }
   }
 
@@ -506,13 +513,21 @@ void doCompileObjects(vector<string*>& cmds) {
     ::memcpy(buf, s, n+1);
 
     if (::system(cmd)) {
-      g_has_build_fail = true;
-      OSS(ss) << RED << "compile fail: " << buf << RESET << "\n";
+      {
+        OSS(ss) << RED << "[exec fail: " << cmd << "]" << RESET << "\n";
+        cout << ss.str();
+      }
+      OSS(ss) << RED << "[compile fail: " << buf << "]" << RESET << "\n";
       cout << ss.str();
+      g_has_build_fail = true;
       break;
     } else {
+      if (g_debug) {
+        OSS(ss) << YELLOW << "[exec ok: " << cmd << "]" << RESET << "\n";
+        cout << ss.str();
+      }
       g_compile_objects_n++;
-      OSS(ss) << BLUE << "compile ok: " << buf << RESET << "\n";
+      OSS(ss) << BLUE << "[compile ok: " << buf << "]" << RESET << "\n";
       cout << ss.str();
     }
   }
@@ -630,7 +645,11 @@ void build(TargetMgr& targetMgr) {
   g_leaf_target_left.wait();
 }
 
-int main() {
+int main(int argc, const char* argv[]) {
+  if (argc == 2 && argv[1] == string("debug")) {
+    g_debug = true;
+  }
+
   TargetMgr rootTargets;
   parseBuildYml("build.yml", rootTargets);
   g_project_name = rootTargets.project_name;
